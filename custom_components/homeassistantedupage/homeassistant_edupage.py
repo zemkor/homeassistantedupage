@@ -1,3 +1,25 @@
+import json
+from edupage_api.lunches import Lunches, Meals
+from edupage_api.grades import Grades as _EduGrades
+
+# edupage-api 0.13.3 looks up grade details with the raw ``udalostid`` value,
+# which EduPage now sends as a number while the details are keyed by strings,
+# so every grade fails with "'NoneType' object has no attribute 'get'".
+# Fixed upstream in EdupageAPI/edupage-api#135 (not yet released): normalise
+# the ids to strings right after the grade page is parsed.
+_orig_parse_grade_data = _EduGrades._Grades__parse_grade_data
+
+if not getattr(_orig_parse_grade_data, "_udalostid_str_patch", False):
+
+    def _parse_grade_data_str_ids(self, data):
+        parsed = _orig_parse_grade_data(self, data)
+        for grade in parsed.get("vsetkyZnamky") or []:
+            if isinstance(grade, dict) and grade.get("udalostid") is not None:
+                grade["udalostid"] = str(grade["udalostid"])
+        return parsed
+
+    _parse_grade_data_str_ids._udalostid_str_patch = True
+    _EduGrades._Grades__parse_grade_data = _parse_grade_data_str_ids
 import logging
 
 from edupage_api import Edupage as APIEdupage
@@ -109,11 +131,48 @@ class Edupage:
         except Exception as e:  # noqa: BLE001
             raise UpdateFailed(f"EDUPAGE error updating get_classes() data from API: {e}")
 
-    async def get_grades(self):
+    def _in_child_context(self, student, func, *args):
+        """Run an API call in the selected child's context (parent accounts).
+
+        EduPage serves grades and the canteen of the *logged-in* user. For a
+        parent account that is the parent, who has no boarder id and no grades,
+        so switch to the child first and always restore the parent afterwards.
+        Student accounts raise NotParentException and are called directly.
+        """
+        if student is None:
+            return func(*args)
         try:
-            return await self.hass.async_add_executor_job(self.api.get_grades)
+            self.api.switch_to_child(student)
+        except NotParentException:
+            return func(*args)
         except Exception as e:  # noqa: BLE001
-            raise UpdateFailed(f"EDUPAGE error updating get_grades() data from API: {e}")
+            _LOGGER.warning("EDUPAGE switch_to_child failed: %r", e)
+            raise
+        try:
+            return func(*args)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning(
+                "EDUPAGE %s in child context failed: %r",
+                getattr(func, "__name__", func),
+                e,
+            )
+            if "grade" in str(getattr(func, "__name__", "")):
+                self._log_grade_page()
+            raise
+        finally:
+            try:
+                self.api.switch_to_parent()
+            except Exception as e:  # noqa: BLE001
+                # Do not let a failed switch-back discard the fetched data.
+                _LOGGER.warning("EDUPAGE switch_to_parent failed: %r", e)
+
+    async def get_grades(self, student=None):
+        try:
+            return await self.hass.async_add_executor_job(
+                self._in_child_context, student, self.api.get_grades
+            )
+        except Exception as e:  # noqa: BLE001
+            raise UpdateFailed(f"EDUPAGE error updating get_grades() data from API: {e!r}")
 
     def _get_text_grades(self, student):
         """Read in the selected child's context and restore the parent."""
@@ -217,10 +276,94 @@ class Edupage:
                 f"EDUPAGE error updating get_timetable() data for {day}: {e}"
             )
 
-    async def get_meals(self, day):
+    def _fetch_meals_day(self, day):
+        """Fetch one day of meals.
+
+        Same parsing as edupage-api's get_meals(), but the canteen data is not
+        always stored under the school's subdomain: some schools share a
+        canteen that EduPage keys under its own name (e.g. "ticha"). Fall back
+        to the first entry that actually contains a menu ("novyListok").
+        """
+        subdomain = self.api.subdomain
+        url = f"https://{subdomain}.edupage.org/menu/?date={day.strftime('%Y%m%d')}"
+        response = self.api.session.get(url).content.decode()
+        if "edupageData: " not in response:
+            return None
+        lunch_data = json.loads(response.split("edupageData: ")[1].split(",\r\n")[0])
+        if not lunch_data:
+            return None
+        canteen = lunch_data.get(subdomain)
+        if not isinstance(canteen, dict) or "novyListok" not in canteen:
+            canteen = next(
+                (
+                    value
+                    for value in lunch_data.values()
+                    if isinstance(value, dict) and "novyListok" in value
+                ),
+                None,
+            )
+        if canteen is None:
+            return None
+        listok = canteen.get("novyListok") or {}
+        boarder_id = (listok.get("addInfo") or {}).get("stravnikid")
+        meals = listok.get(day.strftime("%Y-%m-%d"))
+        if not meals:
+            return None
+        parser = Lunches(self.api)
+        return Meals(
+            parser.parse_meal("1", meals.get("1"), boarder_id, day),
+            parser.parse_meal("2", meals.get("2"), boarder_id, day),
+            parser.parse_meal("3", meals.get("3"), boarder_id, day),
+        )
+
+    def _log_grade_page(self):
+        """Diagnostics only: describe the grades page without personal data."""
+        try:
+            url = f"https://{self.api.subdomain}.edupage.org/znamky/"
+            page = self.api.session.get(url).content.decode()
+            marker = ".znamkyStudentViewer("
+            info = {"viewer": marker in page, "length": len(page)}
+            if marker in page:
+                raw = page.split(marker, 1)[1].split(");\r\n\t\t});\r\n\t\t</script>")[0]
+                data = json.loads(raw)
+                events = data.get("vsetkyUdalosti")
+                info["grades"] = len(data.get("vsetkyZnamky") or [])
+                info["events_type"] = type(events).__name__
+                info["events_keys"] = list(events)[:5] if isinstance(events, dict) else None
+            _LOGGER.warning("EDUPAGE grade page diagnostics: %s", info)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning("EDUPAGE grade page diagnostics failed: %r", e)
+
+    def _get_meals_range(self, days):
+        """Fetch several days of meals, keeping per-day errors separate."""
+        results = {}
+        for day in days:
+            try:
+                results[day] = self._fetch_meals_day(day)
+            except (IndexError, AttributeError) as e:
+                _LOGGER.debug(
+                    "EDUPAGE get_meals returned empty or unsupported data for %s: %s",
+                    day,
+                    e,
+                )
+                results[day] = None
+            except Exception as e:  # noqa: BLE001
+                results[day] = e
+        return results
+
+    async def get_meals_range(self, days, student=None):
+        """Fetch meals for all days in one child-context switch."""
         try:
             return await self.hass.async_add_executor_job(
-                self.api.get_meals, day
+                self._in_child_context, student, self._get_meals_range, days
+            )
+        except Exception as e:  # noqa: BLE001
+            raise UpdateFailed(f"EDUPAGE error updating meals data: {e!r}") from e
+
+    async def get_meals(self, day, student=None):
+        try:
+            return await self.hass.async_add_executor_job(
+                self._in_child_context, student, self.api.get_meals, day
             )
         except (IndexError, AttributeError) as e:
             _LOGGER.debug(
@@ -280,15 +423,19 @@ class Edupage:
                 f"EDUPAGE error updating get_school_year() data from API: {e}"
             )
 
-    async def get_grades_for_term(self, year: int, term):
+    async def get_grades_for_term(self, year: int, term, student=None):
         """Returns grades for a specific school term."""
         try:
             return await self.hass.async_add_executor_job(
-                self.api.get_grades_for_term, year, term
+                self._in_child_context,
+                student,
+                self.api.get_grades_for_term,
+                year,
+                term,
             )
         except Exception as e:  # noqa: BLE001
             raise UpdateFailed(
-                f"EDUPAGE error updating get_grades_for_term() data from API: {e}"
+                f"EDUPAGE error updating get_grades_for_term() data from API: {e!r}"
             )
 
     # ------------------------------------------------------------------

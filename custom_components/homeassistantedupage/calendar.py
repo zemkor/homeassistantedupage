@@ -259,7 +259,13 @@ class EdupageCanteenCalendar(CoordinatorEntity, CalendarEntity):
             if end_time <= start_time:
                 end_time = end_time + timedelta(days=1)
 
-        summary = meal.meal_type.name.replace("_", " ").capitalize()
+        names = {"SNACK": "Desiata", "LUNCH": "Obed", "AFTERNOON_SNACK": "Olovrant"}
+        name = names.get(meal.meal_type.name, meal.meal_type.name.capitalize())
+        ordered = str(meal.ordered_meal or "").strip().upper()
+        # EduPage sends the chosen menu letter (A-H) for an ordered meal and
+        # "X"/"AX" (or nothing) when the boarder is signed off.
+        is_ordered = bool(ordered) and "X" not in ordered
+        summary = f"{name} ({'prihlásený' if is_ordered else 'odhlásený'})"
         description = meal.title
 
         return CalendarEvent(

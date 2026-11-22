@@ -89,7 +89,7 @@ async def _collect_data(edupage, student, student_name):
             _LOGGER.warning("get_classes failed: %s", e)
 
     try:
-        grades = await edupage.get_grades()
+        grades = await edupage.get_grades(student)
         data_ok["grades"] = True
     except Exception as e:  # noqa: BLE001
         _LOGGER.warning("get_grades failed: %s", e)
@@ -156,16 +156,22 @@ async def _collect_data(edupage, student, student_name):
 
     canteen_menu_data = {}
     canteen_ok = False
-    for offset in range(14):
-        current_date = today + timedelta(days=offset)
-        try:
-            meals = await edupage.get_meals(current_date)
-        except Exception as e:  # noqa: BLE001
+    canteen_days = [today + timedelta(days=offset) for offset in range(14)]
+    try:
+        meals_by_day = await edupage.get_meals_range(canteen_days, student)
+    except Exception as e:  # noqa: BLE001
+        _LOGGER.warning("Failed to fetch meals data: %s", e)
+        meals_by_day = {}
+    for current_date in canteen_days:
+        meals = meals_by_day.get(current_date)
+        if isinstance(meals, Exception):
             _LOGGER.warning(
                 "Failed to fetch meals data for %s: %s",
                 current_date,
-                e,
+                meals,
             )
+            continue
+        if current_date not in meals_by_day:
             continue
         canteen_ok = True
         meals_to_add = []
@@ -222,7 +228,7 @@ async def _collect_data(edupage, student, student_name):
                 grades_per_term[
                     term_key
                 ] = await edupage.get_grades_for_term(
-                    school_year, term_enum
+                    school_year, term_enum, student
                 )
             except Exception as e:  # noqa: BLE001
                 _LOGGER.warning(
